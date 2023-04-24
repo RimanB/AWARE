@@ -25,7 +25,7 @@ AWARE is a self-supervised geometric deep learning model that can generate prote
 Given the multi-scale nature of the model inputs, AWARE is equipped to learn protein-level, celltype-level, and tissue-level topology in a single unified embedding space. To fully leverage the multi-scale inputs, AWARE uses protein-, celltype-, and tissue-level attention mechanisms and objective functions to inject cellular and tissue organization into the embedding space. AWARE is designed such that pairs of nodes that share an edge are embedded nearby each other, protein representations of the same celltype are embedded close by (and far from protein representations of a different celltype), and protein representations are embedded close to the representation of their corresponding celltype (and far from other celltype representations).
 
 <p align="center">
-<img src="img/aware_overview.png?raw=true" width="250" >
+<img src="img/aware_overview.png?raw=true" width="750" >
 </p>
 
 
