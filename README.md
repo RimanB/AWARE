@@ -52,7 +52,7 @@ bash install_pyg.sh
 
 ### :three: Download Datasets
 
-The data is hosted on [Figshare](https://figshare.com/articles/software/AWARE). To maintain the directory structure while downloading the files, make sure to select all files and download in the original format. Make sure to also unzip all files in the download.
+The data is hosted on [Figshare](https://figshare.com/articles/software/AWARE/22708126). To maintain the directory structure while downloading the files, make sure to select all files and download in the original format. Make sure to also unzip all files in the download.
 
 We provide the following datasets for training AWARE:
 - Global reference protein interaction network
