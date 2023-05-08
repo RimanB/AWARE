@@ -1,7 +1,7 @@
 # Pytorch 
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GINConv, SAGEConv, GCNConv, GATConv, BatchNorm, LayerNorm, GraphNorm
+from torch_geometric.nn import GATConv, BatchNorm, LayerNorm, GraphNorm
 from torch_geometric.nn.inits import glorot, zeros
 import torch.nn.functional as F
 
@@ -11,31 +11,19 @@ import math
 
 
 class PCTConv(nn.Module):
-    def __init__(self, in_channels, num_ppi_relations, num_cci_bto_relations, ppi_data, out_channels, sem_att_channels, norm=None, node_heads=3, tissue_update=100):
+    def __init__(self, in_channels, num_ppi_relations, num_metagraph_relations, ppi_data, out_channels, sem_att_channels, norm=None, node_heads=3, tissue_update=100):
         super().__init__()
         
         self.ppi_data = ppi_data
         self.in_channels = in_channels
         self.num_ppi_relations = num_ppi_relations
-        self.num_cci_bto_relations = num_cci_bto_relations
+        self.num_metagraph_relations = num_metagraph_relations
         self.out_channels = out_channels
         self.sem_att_channels = sem_att_channels
         self.node_heads = node_heads
         self.tissue_update = tissue_update
         
-        # Alternative conv layer (no metapath attention)
-        conv_type = "GAT"
-        if conv_type == "GIN":
-            nn1 = nn.Sequential(nn.Linear(in_channels, out_channels * node_heads))
-            self.altconv = GINConv(nn1)
-        elif conv_type == "SAGE":
-            self.altconv = SAGEConv(in_channels, out_channels * node_heads)
-        elif conv_type == "GAT":
-            self.altconv = GATConv(in_channels, out_channels, node_heads)
-        elif conv_type == "GCN":
-            self.altconv = GCNConv(in_channels, out_channels * node_heads)
-
-        # 1. Cell-type specific PPI layers meta-path attention
+        # 1. Cell-type specific PPI layers edge type attention
         self.ppi_node_gats = torch.nn.ModuleList()
         for _ in range(num_ppi_relations):
             self.ppi_node_gats.append(GATConv(in_channels, out_channels, node_heads))
@@ -45,19 +33,19 @@ class PCTConv(nn.Module):
         for celltype, ppi in ppi_data.items():
             self.ppi_w.append(GATConv(in_channels, out_channels, node_heads))
         
-        if norm=='layernorm':
+        if norm == 'layernorm':
             self.norm = LayerNorm(out_channels * node_heads)
-        elif norm=='batchnorm':
+        elif norm == 'batchnorm':
             self.norm = BatchNorm(out_channels * node_heads)
-        elif norm=='graphnorm':
+        elif norm == 'graphnorm':
             self.norm = GraphNorm(out_channels * node_heads)
         else:
             self.norm = None
         
-        # 3. CCI-BTO meta-path attention
-        self.cci_bto_node_gats = torch.nn.ModuleList()
-        for _ in range(num_cci_bto_relations):
-            self.cci_bto_node_gats.append(GATConv(out_channels * node_heads, out_channels, node_heads))
+        # 3. Metagraph edge type attention
+        self.metagraph_node_gats = torch.nn.ModuleList()
+        for _ in range(num_metagraph_relations):
+            self.metagraph_node_gats.append(GATConv(out_channels * node_heads, out_channels, node_heads))
 
         self.W = nn.Parameter(torch.Tensor(1, 1, out_channels * node_heads, sem_att_channels))
         self.b = nn.Parameter(torch.Tensor(1, 1, sem_att_channels))
@@ -70,10 +58,10 @@ class PCTConv(nn.Module):
         zeros(self.b)
         glorot(self.q)
 
-    def _per_data_forward(self, x, metapaths, node_gats):
+    def _per_data_forward(self, x, edgetypes, node_gats):
 
         # Calculate node-level attention representations
-        out = [gat(x, metapath) for gat, metapath in zip(node_gats, metapaths) if metapath.shape[1] > 0]
+        out = [gat(x, edgetype) for gat, edgetype in zip(node_gats, edgetypes) if edgetype.shape[1] > 0]
         out = torch.stack(out, dim=1).to(x.device)
     
         # Apply non-linearity
@@ -87,57 +75,46 @@ class PCTConv(nn.Module):
         z = torch.sum(out * beta.unsqueeze(-1), dim=1)
         return z
 
-    def forward(self, ppi_x, cci_bto_x, ppi_metapaths, cci_bto_metapaths, ppi_edge_index, cci_bto_edge_index, tissue_neighbors, metapath_att, apply_ppi_att=True, metagraph=True, init_cci=False):
+    def forward(self, ppi_x, metagraph_x, ppi_edgetypes, metagraph_edgetypes, ppi_edge_index, metagraph_edge_index, tissue_neighbors, init_cci=False):
         
         ########################################
         # Update PPI layers
         ########################################
 
         if init_cci: # Initialize CCI embeddings using PPI embeddings
-            cci_bto_x_list = []
+            metagraph_x_list = []
             for celltype, x in ppi_x.items(): # Iterate through cell-type specific PPI layers
                 
-                if len(ppi_metapaths[celltype]) == 0: ppi_x[celltype] = []
-                else:
-                    # Update cell-type's PPI embeddings using meta-path attention
-                    if metapath_att: 
-                        ppi_x[celltype] = self._per_data_forward(x, ppi_metapaths[celltype], self.ppi_node_gats)
-                    else: # TODO: Weights are shared between PPI layers; not equivalent to metapath_att=True
-                        ppi_x[celltype] = self.altconv(x, self.ppi_data[celltype].edge_index.to(x.device))
+                # Update cell type's PPI embeddings using edge type attention
+                ppi_x[celltype] = self._per_data_forward(x, ppi_edgetypes[celltype], self.ppi_node_gats)
                 
-                if metagraph:
-                    cci_bto_x_list.append(torch.mean(ppi_x[celltype], 0))
+                metagraph_x_list.append(torch.mean(ppi_x[celltype], 0))
             
-            if metagraph: # Concatenate initialized metagraph embeddings
-                cci_bto_x = torch.stack(cci_bto_x_list)
-                cci_bto_x = torch.cat((cci_bto_x, torch.zeros(len(tissue_neighbors), cci_bto_x.shape[1]).long().to(cci_bto_x.device)))
-
+            # Concatenate initialized metagraph embeddings
+            metagraph_x = torch.stack(metagraph_x_list)
+            metagraph_x = torch.cat((metagraph_x, torch.zeros(len(tissue_neighbors), metagraph_x.shape[1]).long().to(metagraph_x.device)))
 
         ########################################
-        # Update CCI-BTO embeddings
+        # Update metagraph embeddings
         ########################################
 
         else:
-            if metagraph: # Up-pool from PPI
-                for celltype, x in ppi_x.items(): # Iterate through cell-type specific PPI layers
-                    if self.norm is not None:
-                        att_ppi = self.norm(x + self.ppi_w[celltype](x, ppi_metapaths[celltype][0]))  # Changed from ppi_data (self.ppi_data[celltype].edge_index.to(x.device)) to input ppi_metapaths (ppi_metapaths[celltype][0])
-                    else:
-                        att_ppi = x + self.ppi_w[celltype](x, ppi_metapaths[celltype][0])  # Changed from ppi_data (self.ppi_data[celltype].edge_index.to(x.device)) to input ppi_metapaths (ppi_metapaths[celltype][0])
-                    if not apply_ppi_att: att_ppi = x
-                    cci_bto_x[celltype, :] += torch.mean(att_ppi, 0)
+            for celltype, x in ppi_x.items(): # Iterate through cell-type specific PPI layers
+                if self.norm is not None:
+                    att_ppi = self.norm(x + self.ppi_w[celltype](x, ppi_edgetypes[celltype][0]))
+                else:
+                    att_ppi = x + self.ppi_w[celltype](x, ppi_edgetypes[celltype][0])
+                metagraph_x[celltype, :] += torch.mean(att_ppi, 0)
 
-        if metagraph: # Update full metagraph
-            
-            # Initialize (or update) tissue embeddings using cell-type embeddings
-            for i in range(self.tissue_update):
-                for t in sorted(tissue_neighbors):
-                    cci_bto_x[t, :] = torch.mean(cci_bto_x[tissue_neighbors[t]], 0)
+        # Initialize (or update) tissue embeddings using cell-type embeddings
+        for i in range(self.tissue_update):
+            for t in sorted(tissue_neighbors):
+                metagraph_x[t, :] = torch.mean(metagraph_x[tissue_neighbors[t]], 0)
 
-            # Update CCI-BTO embeddings using meta-path attention
-            cci_bto_x = self._per_data_forward(cci_bto_x, cci_bto_metapaths, self.cci_bto_node_gats)
+        # Update metagraph embeddings using edge type attention
+        metagraph_x = self._per_data_forward(metagraph_x, metagraph_edgetypes, self.metagraph_node_gats)
         
-        return ppi_x, cci_bto_x
+        return ppi_x, metagraph_x
 
 
 class PPIConv(nn.Module):
@@ -164,13 +141,13 @@ class PPIConv(nn.Module):
         zeros(self.b)
         glorot(self.q)
 
-    def _per_data_forward(self, x, metapaths, node_gats):
+    def _per_data_forward(self, x, edgetypes, node_gats):
 
         # Calculate node-level attention representations
-        out = [gat(x, metapath) for gat, metapath in zip(node_gats, metapaths)]
+        out = [gat(x, edgetype) for gat, edgetype in zip(node_gats, edgetypes)]
         out = torch.stack(out, dim=1).to(x.device)
         
-        # Apply non-linearity
+        # Apply nonlinear layer
         out = F.relu(out)
 
         # Aggregate node-level representation using semantic level attention
@@ -182,7 +159,7 @@ class PPIConv(nn.Module):
 
         return z
 
-    def forward(self, ppi_x, ppi_metapaths, cci_bto_x, ppi_w, metagraph):
+    def forward(self, ppi_x, ppi_edgetypes, metagraph_x, ppi_w, metagraph):
         
         ########################################
         # Update PPI layers
@@ -190,14 +167,13 @@ class PPIConv(nn.Module):
         
         for celltype, x in ppi_x.items(): # Iterate through cell-type specific PPI layers
 
-            if len(ppi_metapaths[celltype]) == 0: ppi_x[celltype] = []
+            if len(ppi_edgetypes[celltype]) == 0: ppi_x[celltype] = []
             else:
-                # Update using meta-path attention
-                ppi_x[celltype] = self._per_data_forward(x, ppi_metapaths[celltype], self.ppi_node_gats)
+                # Update using edge type attention
+                ppi_x[celltype] = self._per_data_forward(x, ppi_edgetypes[celltype], self.ppi_node_gats)
 
             # Downpool using cell-type embedding
-            if metagraph:
-                gamma = (ppi_w[celltype].att_src + ppi_w[celltype].att_dst).flatten(0)  # Different PyG versions use different notations, att_r=att_src, att_l=att_dst.
-                ppi_x[celltype] += (cci_bto_x[celltype, :] * gamma.to(x.device))
+            gamma = (ppi_w[celltype].att_src + ppi_w[celltype].att_dst).flatten(0)  # Different PyG versions use different notations, att_r=att_src, att_l=att_dst.
+            ppi_x[celltype] += (metagraph_x[celltype, :] * gamma.to(x.device))
 
         return ppi_x

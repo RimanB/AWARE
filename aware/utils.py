@@ -27,29 +27,31 @@ from sklearn.metrics import roc_auc_score, average_precision_score, accuracy_sco
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def calc_link_pred_loss(cci_bto_pred, cci_bto_y, ppi_preds, ppi_y, loss_type="BCE"):
-    loss = 0
+def calc_link_pred_loss(metagraph_pred, metagraph_y, ppi_preds, ppi_y, loss_type="BCE"):
+
+    def max_margin_loss(pred, y):
+        loss = (1 - (pred[y == 1] - pred[y != 1])).clamp(min=0)
+        return loss
+
+    loss = 0 # Initialize loss
     if loss_type == "BCE":
-        if len(cci_bto_pred) > 0:
-            loss = F.binary_cross_entropy(cci_bto_pred, cci_bto_y["y"].to(device))
+        if len(metagraph_pred) > 0:
+            loss = F.binary_cross_entropy(metagraph_pred, metagraph_y["y"].to(device))
         for celltype, ppi in ppi_preds.items():
             loss += F.binary_cross_entropy(ppi, ppi_y[celltype]["y"].to(device))
+    
     elif loss_type == "max-margin":
-        if len(cci_bto_pred) > 0:
-            loss = max_margin_loss(cci_bto_pred, cci_bto_y["y"].to(device))
+        if len(metagraph_pred) > 0:
+            loss = max_margin_loss(metagraph_pred, metagraph_y["y"].to(device))
         for celltype, ppi in ppi_preds.items():
             loss = torch.cat((loss, max_margin_loss(ppi, ppi_y[celltype]["y"].to(device))))
         loss = loss.mean()
+    
     return loss
 
 
 def calc_center_loss(center_loss, embed, centers, y, mask):
     loss = center_loss(embed[mask, :], centers, y[mask].to(device))
-    return loss
-
-
-def max_margin_loss(pred, y):
-    loss = (1 - (pred[y == 1] - pred[y != 1])).clamp(min=0)
     return loss
 
 
@@ -72,15 +74,15 @@ def calc_individual_metrics(pred, y):
     return roc_score, ap_score, acc, f1
 
 
-def calc_metrics(cci_bto_pred, cci_bto_data, ppi_preds, ppi_data):
+def calc_metrics(metagraph_pred, metagraph_data, ppi_preds, ppi_data):
     all_roc = []
     all_ap = []
     all_acc = []
     all_f1 = []
 
-    # Compute metrics for CCI-BTO
-    if len(cci_bto_pred) > 0:
-        roc_score, ap_score, acc, f1 = calc_individual_metrics(cci_bto_pred.cpu().detach().numpy(), cci_bto_data["y"].cpu().detach().numpy())
+    # Compute metrics for metagraph
+    if len(metagraph_pred) > 0:
+        roc_score, ap_score, acc, f1 = calc_individual_metrics(metagraph_pred.cpu().detach().numpy(), metagraph_data["y"].cpu().detach().numpy())
         all_roc.append(roc_score)
         all_ap.append(ap_score)
         all_acc.append(acc)
@@ -96,17 +98,17 @@ def calc_metrics(cci_bto_pred, cci_bto_data, ppi_preds, ppi_data):
     return np.average(all_roc), np.average(all_ap), np.average(all_acc), np.average(all_f1)
 
 
-def metrics_per_rel(cci_bto_pred, cci_bto_data, ppi_preds, ppi_data, edge_attr_dict, celltype_map, log_f, wandb, split):
+def metrics_per_rel(metagraph_pred, metagraph_data, ppi_preds, ppi_data, edge_attr_dict, celltype_map, log_f, wandb, split):
     
     celltype_map = {v: k for k, v in celltype_map.items()}
 
-    # Compute metrics per rel for CCI-BTO
-    if len(cci_bto_pred) > 0:
+    # Compute metrics per rel for metagraph
+    if len(metagraph_pred) > 0:
         for attr, idx in edge_attr_dict.items():
-            mask = (cci_bto_data["total_edge_type"].cpu().detach().numpy() == idx)
+            mask = (metagraph_data["total_edge_type"].cpu().detach().numpy() == idx)
             if mask.sum() == 0: continue
-            pred_per_rel = cci_bto_pred.cpu().detach().numpy()[mask]
-            y_per_rel = cci_bto_data["y"].cpu().detach().numpy()[mask]
+            pred_per_rel = metagraph_pred.cpu().detach().numpy()[mask]
+            y_per_rel = metagraph_data["y"].cpu().detach().numpy()[mask]
             roc_per_rel, ap_per_rel, acc_per_rel, f1_per_rel = calc_individual_metrics(pred_per_rel, y_per_rel)
             log_f.write("ROC for edge type {}: {:.5f}\n".format(attr, roc_per_rel))
             log_f.write("AP for edge type {}: {:.5f}\n".format(attr, ap_per_rel))
@@ -129,7 +131,7 @@ def metrics_per_rel(cci_bto_pred, cci_bto_data, ppi_preds, ppi_data, edge_attr_d
             wandb.log({"%s_%s_%s_roc" % (celltype_map[celltype], attr, split): roc_per_rel, "%s_%s_%s_ap" % (celltype_map[celltype], attr, split): ap_per_rel, "%s_%s_%s_acc" % (celltype_map[celltype], attr, split): acc_per_rel, "%s_%s_%s_f1" % (celltype_map[celltype], attr, split): f1_per_rel})
 
 
-def construct_metapath(metapaths, edge_index, edge_type, num_nodes):
+def construct_edgetype(edgetypes, edge_index, edge_type, num_nodes):
     unique_edge_types = edge_type.unique()
 
     adjs = {}
@@ -139,9 +141,9 @@ def construct_metapath(metapaths, edge_index, edge_type, num_nodes):
         adjs[int(et)] = adj
 
     mp_adjs = []
-    for metapath in metapaths:
+    for edgetype in edgetypes:
         mp_adj = None
-        for idx in metapath:
+        for idx in edgetype:
             if idx not in adjs: continue
             if mp_adj:
                 mp_adj @= adjs[idx]
@@ -154,46 +156,46 @@ def construct_metapath(metapaths, edge_index, edge_type, num_nodes):
 
 
 @torch.no_grad()
-def get_embeddings(model, ppi_x, cci_bto_x, ppi_metapaths, cci_bto_metapaths, ppi_edge_index, cci_bto_edge_index, tissue_neighbors):
+def get_embeddings(model, ppi_x, metagraph_x, ppi_edgetypes, metagraph_edgetypes, ppi_edge_index, metagraph_edge_index, tissue_neighbors):
     model.eval()
-    ppi_x, cci_bto_x = model(ppi_x, cci_bto_x, ppi_metapaths, cci_bto_metapaths, ppi_edge_index, cci_bto_edge_index, tissue_neighbors)
-    return ppi_x, cci_bto_x 
+    ppi_x, metagraph_x = model(ppi_x, metagraph_x, ppi_edgetypes, metagraph_edgetypes, ppi_edge_index, metagraph_edge_index, tissue_neighbors)
+    return ppi_x, metagraph_x 
 
 
-def plot_emb(best_ppi_x, best_cci_bto_x, celltype_map, ppi_layers, cci_bto, wandb, finetune_labels):
+def plot_emb(best_ppi_x, best_metagraph_x, celltype_map, ppi_layers, metagraph, wandb, finetune_labels):
     celltype_map = {v: k for k, v in celltype_map.items()}
-    embed, labels_df, cci_bto_labels = combine_embed(best_ppi_x, best_cci_bto_x, celltype_map, ppi_layers, cci_bto, finetune_labels)
+    embed, labels_df, metagraph_labels = combine_embed(best_ppi_x, best_metagraph_x, celltype_map, ppi_layers, metagraph, finetune_labels)
     mapping, embedding = fit_umap(embed, min_dist=0.5)
 
     labels_df["x"] = embedding[:, 0]
     labels_df["y"] = embedding[:, 1]
     plot_umap(labels_df, wandb, "umap.all")
-    if len(best_cci_bto_x) > 0:
-        cci_bto_labels["x"] = embedding[0:len(celltype_map), 0]
-        cci_bto_labels["y"] = embedding[0:len(celltype_map), 1]
-        plot_umap(cci_bto_labels, wandb, "umap.ccibto")
+    if len(best_metagraph_x) > 0:
+        metagraph_labels["x"] = embedding[0:len(celltype_map), 0]
+        metagraph_labels["y"] = embedding[0:len(celltype_map), 1]
+        plot_umap(metagraph_labels, wandb, "umap.ccibto")
     labels_df.pop("x")
     labels_df.pop("y")
     return labels_df
 
 
-def combine_embed(ppi_embed, cci_bto_embed, key, ppi_layers, cci_bto, finetune_labels):
+def combine_embed(ppi_embed, metagraph_embed, key, ppi_layers, metagraph, finetune_labels):
     labels_df = dict()
-    cci_bto_labels = dict()
+    metagraph_labels = dict()
 
-    if len(cci_bto_embed) > 0:
+    if len(metagraph_embed) > 0:
 
-        # Set CCI-BTO labels
+        # Set metagraph labels
         labels_df["Cell Type"] = ["CCI_" + v if "BTO" not in v else v for k, v in key.items()]
-        cci_bto_labels["Cell Type"] = [v if "BTO" not in v else v for k, v in key.items()]
+        metagraph_labels["Cell Type"] = [v if "BTO" not in v else v for k, v in key.items()]
         labels_df["Name"] = ["CCI_" + v if "BTO" not in v else v for k, v in key.items()]
 
-        labels_df["Degree"] = [100] * len(cci_bto.nodes) # Artificially increase size
-        labels_df["Relative Degree"] = [1] * len(cci_bto.nodes)
-        cci_bto_labels["Degree"] = [cci_bto.degree[n] for n in cci_bto.nodes]
+        labels_df["Degree"] = [100] * len(metagraph.nodes) # Artificially increase size
+        labels_df["Relative Degree"] = [1] * len(metagraph.nodes)
+        metagraph_labels["Degree"] = [metagraph.degree[n] for n in metagraph.nodes]
         
         pcount_labels = [0] * len(key)
-        combined = [cci_bto_embed]
+        combined = [metagraph_embed]
 
     else: 
         labels_df["Cell Type"] = []
@@ -236,7 +238,7 @@ def combine_embed(ppi_embed, cci_bto_embed, key, ppi_layers, cci_bto, finetune_l
     labels_df["Name"] += ["Sanity Check %s" % k for k in sanity]
     labels_df["Overlap"] += [0] * len(sanity)
     
-    return combined, labels_df, cci_bto_labels
+    return combined, labels_df, metagraph_labels
 
 
 def fit_umap(embed, n_neighbors=15, min_dist=0.1, n_components=2, metric='euclidean', random_state=3):

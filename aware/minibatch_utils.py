@@ -6,42 +6,14 @@ import torch
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader, GraphSAINTRandomWalkSampler, GraphSAINTEdgeSampler
 
-from utils import construct_metapath, el_dot, calc_link_pred_loss, calc_center_loss, get_embeddings
+from utils import construct_edgetype, el_dot, calc_link_pred_loss, calc_center_loss, get_embeddings
 
 
-def pred_batch2dict(packed_batch: object, cci_bto_x_ori: dict, ppi_x_ori: dict, cell_type_order: list, device: str) -> dict:
-    """
-    Re-initialize :code:`ppi_x`, :code:`cci_bto`, and transform packed batches of all graphs to a dictionary of batches. Note that different from :code:`train_batch2dict`, we are also re-initializing full :code:`ppi_x` because we are feeding all nodes instead of the sampled nodes in the batch to the model during prediction.
-    
-    :param packed_batch: An iterable (tuple if directly following unpacking of the output of :code:`generatePPIBatch`) storing batches of :class:`Data` from all graphs in one round.
-    :param cci_bto_x_ori: CCI-BTO original node embeddings.
-    :param ppi_x_ori: Original all PPI node embeddings
-    :param cell_type_order: Cell type order.
-    :param device: A string indicating the device. Default is "cuda".
-    
-    :return: A dictionary of edge data storing batches from all graphs in one round, :code:`ppi_x_batch`, :code:`ppi_node_ind_batch` extracted from batches, and the re-initialized node embeddings :code:`cci_bto_x_init`.
-    """
-    # Re-initalize cci_bto_x from cci_bto_x in each batch
-    ppi_x_init = {key:x.clone().to(device) for key, x in ppi_x_ori.items()}
-    cci_bto_x_init = cci_bto_x_ori.clone().to(device) if len(cci_bto_x_ori)!=0 else []
-    
-    # Unpack batches
-    ppi_data_batch = {key:{} for key in cell_type_order}
-    for ind, batch in enumerate(packed_batch):
-        i = cell_type_order[ind]
-        ori_map = batch.n_id
-        ppi_data_batch[i]['total_edge_index'] = ori_map[batch.edge_index].to(device)
-        ppi_data_batch[i]['total_edge_type'] = batch.edge_attr.to(device)
-        ppi_data_batch[i]['y'] = batch.y.to(device)
-    
-    return ppi_data_batch, ppi_x_init, cci_bto_x_init
-
-
-def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_metapaths_ori: dict, cci_bto_x_ori: dict,  cci_bto_metapaths_train: list, cci_bto_data_train: dict, tissue_neighbors: dict, model: torch.nn.Module, hparams: dict, device: str, wandb: object=None, center_loss: torch.nn.Module=None, optimizer: torch.optim=None, mask_train_ori: list=None) -> tuple:
+def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_edgetypes_ori: dict, metagraph_x_ori: dict,  metagraph_edgetypes_train: list, metagraph_data_train: dict, tissue_neighbors: dict, model: torch.nn.Module, hparams: dict, device: str, wandb: object=None, center_loss: torch.nn.Module=None, optimizer: torch.optim=None, mask_train_ori: list=None) -> tuple:
     """
     Iterate batches for train. In each batch, only embeddings of nodes corresponding to the sampled edges (i.e., sampled nodes and their 2-hop neighbors) are attention-pooled to approximate the global embedding of a cell type's PPI, and used to update the node embedding in CCI. 
     
-    :return: :code:`ppi_x_out`, :code:`cci_bto_x`, :code:`cci_bto_pred`, :code:`ppi_preds_all`, :code:`ppi_data_y`, and :code:`total_loss`.
+    :return: :code:`ppi_x_out`, :code:`metagraph_x`, :code:`metagraph_pred`, :code:`ppi_preds_all`, :code:`ppi_data_y`, and :code:`total_loss`.
     """
     total_samples = total_loss = 0
     ppi_preds_all = {}
@@ -56,21 +28,15 @@ def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_metapa
         print(f"Training batch {count}")
         optimizer.zero_grad()
         
-        # Unpack batches to edges, nodes, and indices, and reinitialize cci_bto_x
-        ppi_data_batch, ppi_x, ppi_node_ind_batch, ppi_metapaths_batch, cci_bto_x = train_batch2dict(packed_batch, cci_bto_x_ori, ppi_metapaths_ori, list(ppi_train_loader_dict.keys()), device)
+        # Unpack batches to edges, nodes, and indices, and reinitialize metagraph_x
+        ppi_data_batch, ppi_x, ppi_node_ind_batch, ppi_edgetypes_batch, metagraph_x = train_batch2dict(packed_batch, metagraph_x_ori, ppi_edgetypes_ori, list(ppi_train_loader_dict.keys()), device)
         batch_size = sum([data['y'].shape[0] for data in ppi_data_batch.values()])  # Number of all samples across all cell types
 
-        # Generate PPI and CCI-BTO embeddings & Compute predictions for CCI-BTO
-        ppi_x, cci_bto_x = model(ppi_x, cci_bto_x, ppi_metapaths_batch, cci_bto_metapaths_train, ppi_data_batch, cci_bto_data_train["total_edge_index"], tissue_neighbors)
+        # Generate PPI and metagraph embeddings & Compute predictions for metagraph
+        ppi_x, metagraph_x = model(ppi_x, metagraph_x, ppi_edgetypes_batch, metagraph_edgetypes_train, ppi_data_batch, metagraph_data_train["total_edge_index"], tissue_neighbors)
 
-        # Compute predictions for CCI-BTO for train
-        if hparams['metagraph']: 
-            if hparams['metagraph_relw']:
-                cci_bto_pred = el_dot(cci_bto_x, cci_bto_data_train["total_edge_index"], model.cci_bto_relw[cci_bto_data_train["total_edge_type"]])
-            else:
-                cci_bto_pred = el_dot(cci_bto_x, cci_bto_data_train["total_edge_index"], [])
-        else:
-            cci_bto_pred = []
+        # Compute predictions for metagraph for train
+        metagraph_pred = el_dot(metagraph_x, metagraph_data_train["total_edge_index"], model.metagraph_relw[metagraph_data_train["total_edge_type"]])
         
         # Compute predictions for PPI layers
         ppi_preds = dict()
@@ -82,10 +48,10 @@ def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_metapa
             ppi_x_out[celltype][ppi_node_ind_batch[celltype]] = x.detach().cpu()
 
         # Compute train loss
-        loss = calc_link_pred_loss(cci_bto_pred, cci_bto_data_train, ppi_preds, ppi_data_batch, hparams['loss_type'])
+        loss = calc_link_pred_loss(metagraph_pred, metagraph_data_train, ppi_preds, ppi_data_batch, hparams['loss_type'])
         if hparams['use_center_loss']: 
             embed = torch.cat(list(ppi_x.values())) # Get protein embeddings
-            centers = cci_bto_x[0:len(ppi_x)] # Get cell type embeddings
+            centers = metagraph_x[0:len(ppi_x)] # Get cell type embeddings
 
             # Protein labels
             center_loss_labels = torch.cat([(torch.ones(x.shape[0]) * key).to(torch.long) for key, x in ppi_x.items()])  # Build center loss labels based on batched nodes to ensure consistency with embedding labels
@@ -98,10 +64,10 @@ def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_metapa
             print("Link Prediction: ", loss, "Center Loss: ", cent_loss)
             wandb.log({"Link Prediction Loss": loss, "Center Loss": cent_loss})
             loss += cent_loss * hparams["lambda"]
+
         loss.backward()
-        if hparams['use_center_loss']: 
-            for param in center_loss.parameters():
-                param.grad.data *= (hparams["lr_cent"] / (hparams["lambda"] * hparams["lr"]))
+        for param in center_loss.parameters():
+            param.grad.data *= (hparams["lr_cent"] / (hparams["lambda"] * hparams["lr"]))
         if hparams['gradclip'] != -1: 
             torch.nn.utils.clip_grad_norm_(model.parameters(), hparams['gradclip'])
         optimizer.step()
@@ -113,37 +79,31 @@ def iterate_train_batch(ppi_train_loader_dict: dict, ppi_x_ori: dict, ppi_metapa
 
     total_loss = total_loss/total_samples  # weighted total train loss
     
-    return ppi_x_out, cci_bto_x, cci_bto_pred, ppi_preds_all, ppi_data_y, total_loss
+    return ppi_x_out, metagraph_x, metagraph_pred, ppi_preds_all, ppi_data_y, total_loss
     
     
-def iterate_predict_batch(ppi_loader_dict: dict, ppi_x_ori: dict, ppi_metapaths_eval: dict, cci_bto_x_ori: dict,  cci_bto_metapaths: list, cci_bto_data: dict, tissue_neighbors: dict, model: torch.nn.Module, hparams: dict, device: str) -> tuple:
+def iterate_predict_batch(ppi_loader_dict: dict, ppi_x_ori: dict, ppi_edgetypes_eval: dict, metagraph_x_ori: dict,  metagraph_edgetypes: list, metagraph_data: dict, tissue_neighbors: dict, model: torch.nn.Module, hparams: dict, device: str) -> tuple:
     """
-    Iterate batches for prediction (val/test). To ensure consistent results, the full :code:`ppi_x` is being updated each round with train (for validation), or train & val metapaths (for test), respectively. Minibatching is only performed for edges used for link prediction here to reduce memory cost. Setting val/test batch num to 1 is recommended wherever probable.
+    Iterate batches for prediction (val/test). To ensure consistent results, the full :code:`ppi_x` is being updated each round with train (for validation), or train & val edgetypes (for test), respectively. Minibatching is only performed for edges used for link prediction here to reduce memory cost. Setting val/test batch num to 1 is recommended wherever probable.
     
-    :return: :code:`ppi_x`, :code:`cci_bto_x`, :code:`cci_bto_pred`, :code:`ppi_preds_all`, and :code:`ppi_data_y`.
+    :return: :code:`ppi_x`, :code:`metagraph_x`, :code:`metagraph_pred`, :code:`ppi_preds_all`, and :code:`ppi_data_y`.
     """
     ppi_preds_all = {}
-    ppi_data_y = {key:{'y':torch.tensor([]), 'total_edge_type':torch.tensor([])} for key in ppi_x_ori.keys()}
+    ppi_data_y = {key:{'y': torch.tensor([]), 'total_edge_type': torch.tensor([])} for key in ppi_x_ori.keys()}
     count = 0
     
     for packed_batch in zip(*ppi_loader_dict.values()):
         count += 1
         
-        # Unpack batches and reinitialize cci_bto_x
-        ppi_data_batch, ppi_x, cci_bto_x = pred_batch2dict(packed_batch, cci_bto_x_ori, ppi_x_ori, list(ppi_loader_dict.keys()), device)
+        # Unpack batches and reinitialize metagraph_x
+        ppi_data_batch, ppi_x, metagraph_x = pred_batch2dict(packed_batch, metagraph_x_ori, ppi_x_ori, list(ppi_loader_dict.keys()), device)
         
-        # Generate PPI and CCI-BTO embeddings & Compute predictions for CCI-BTO
-        ppi_x, cci_bto_x = get_embeddings(model, ppi_x, cci_bto_x, ppi_metapaths_eval, cci_bto_metapaths, ppi_data_batch, cci_bto_data["total_edge_index"], tissue_neighbors)
+        # Generate PPI and metagraph embeddings & Compute predictions for metagraph
+        ppi_x, metagraph_x = get_embeddings(model, ppi_x, metagraph_x, ppi_edgetypes_eval, metagraph_edgetypes, ppi_data_batch, metagraph_data["total_edge_index"], tissue_neighbors)
             
-        # Compute predictions for CCI-BTO for val/test only once
-        if count==1:
-            if hparams['metagraph']: 
-                if hparams['metagraph_relw']:
-                    cci_bto_pred = el_dot(cci_bto_x, cci_bto_data["total_edge_index"], model.cci_bto_relw[cci_bto_data["total_edge_type"]])
-                else:
-                    cci_bto_pred = el_dot(cci_bto_x, cci_bto_data["total_edge_index"], [])
-            else:
-                cci_bto_pred = []
+        # Compute predictions for metagraph for val/test only once
+        if count == 1:
+            metagraph_pred = el_dot(metagraph_x, metagraph_data["total_edge_index"], model.metagraph_relw[metagraph_data["total_edge_type"]])
         
         # Compute predictions for PPI layers
         ppi_preds = dict()
@@ -153,7 +113,7 @@ def iterate_predict_batch(ppi_loader_dict: dict, ppi_x_ori: dict, ppi_metapaths_
             ppi_data_y[celltype]['y'] = torch.cat([ppi_data_y[celltype]['y'], ppi_data_batch[celltype]['y'].detach().cpu()])
             ppi_data_y[celltype]['total_edge_type'] = torch.cat([ppi_data_y[celltype]['total_edge_type'], ppi_data_batch[celltype]['total_edge_type'].detach().cpu()])
 
-    return ppi_x, cci_bto_x, cci_bto_pred, ppi_preds_all, ppi_data_y
+    return ppi_x, metagraph_x, metagraph_pred, ppi_preds_all, ppi_data_y
     
 
 def construct_batch_center_loss_mask(original_mask: list, ppi_node_ind_batch: dict, ppi_x_ori: dict) -> list:
@@ -176,48 +136,70 @@ def construct_batch_center_loss_mask(original_mask: list, ppi_node_ind_batch: di
     return train_mask_batch
     
 
-def train_batch2dict(packed_batch: object, cci_bto_x_ori: dict, ppi_metapaths: dict, cell_type_order: list, device: str) -> dict:
+def train_batch2dict(packed_batch: object, metagraph_x_ori: dict, ppi_edgetypes: dict, cell_type_order: list, device: str) -> dict:
     """
-    Re-initialize :code:`cci_bto`, and transform packed batches of all graphs to a dictionary of batches.
+    Re-initialize :code:`metagraph`, and transform packed batches of all graphs to a dictionary of batches.
     
     :param packed_batch: An iterable (tuple if directly following unpacking of the output of :code:`generatePPIBatch`) storing batches of :class:`Data` from all graphs in one round.
-    :param cci_bto_x_ori: CCI-BTO original node embeddings.
-    :param ppi_metapaths: All metapaths.
+    :param metagraph_x_ori: metagraph original node embeddings.
+    :param ppi_edgetypes: All edgetypes.
     :param cell_type_order: Cell type order.
     :param device: A string indicating the device. Default is "cuda".
     
-    :return: A dictionary of edge data from all graphs in one round, :code:`ppi_x_batch`, :code:`ppi_node_ind_batch` and :code:`ppi_metapaths_batch` extracted from batches, and the re-initialized node embeddings :code:`cci_bto_x_init`.
+    :return: A dictionary of edge data from all graphs in one round, :code:`ppi_x_batch`, :code:`ppi_node_ind_batch` and :code:`ppi_edgetypes_batch` extracted from batches, and the re-initialized node embeddings :code:`metagraph_x_init`.
     """
-    # Re-initalize cci_bto_x from cci_bto_x in each batch
-    # ppi_x_init = {key:x.clone().to(device) for key, x in ppi_x.items()}
-    cci_bto_x_init = cci_bto_x_ori.clone().to(device) if len(cci_bto_x_ori)!=0 else []
+    # Re-initalize metagraph_x from metagraph_x in each batch
+    metagraph_x_init = metagraph_x_ori.clone().to(device) if len(metagraph_x_ori) != 0 else []
     
     # Unpack batches
-    ppi_data_batch = {key:{} for key in cell_type_order}
+    ppi_data_batch = {key: {} for key in cell_type_order}
     ppi_x_batch = {}
     ppi_node_ind_batch = {}
-    ppi_metapaths_out = {}
+    ppi_edgetypes_out = {}
     for ind, batch in enumerate(packed_batch):
-        # ori_map = batch.n_id
-        # batch.total_edge_index = ori_map[batch.edge_index]
         i = cell_type_order[ind]
         ppi_node_ind_batch[i] = batch.n_id.to(device)
         ppi_x_batch[i] = batch.x.to(device)
         ppi_data_batch[i]['total_edge_index'] = batch.edge_index.to(device)
         ppi_data_batch[i]['total_edge_type'] = batch.edge_attr.to(device)
         ppi_data_batch[i]['y'] = batch.y.to(device)
-        
-        # Metapath adjs
-        ppi_metapaths_batch = construct_metapath(ppi_metapaths, batch.edge_index[:, batch.y.type(torch.bool)], batch.edge_attr[batch.y.type(torch.bool)], batch.x.shape[0])
-        
-        ppi_metapaths_out[i] = [ppi_metapaths_batch[0].to(device)]
+        ppi_edgetypes_batch = construct_edgetype(ppi_edgetypes, batch.edge_index[:, batch.y.type(torch.bool)], batch.edge_attr[batch.y.type(torch.bool)], batch.x.shape[0])
+        ppi_edgetypes_out[i] = [ppi_edgetypes_batch[0].to(device)]
     
-    return ppi_data_batch, ppi_x_batch, ppi_node_ind_batch, ppi_metapaths_out, cci_bto_x_init
+    return ppi_data_batch, ppi_x_batch, ppi_node_ind_batch, ppi_edgetypes_out, metagraph_x_init
 
 
-def generate_batch(data_dict, metapaths, edge_attr_dict, mask, batch_size, device, ppi=False, loader_type="graphsaint", num_layers=2):
+def pred_batch2dict(packed_batch: object, metagraph_x_ori: dict, ppi_x_ori: dict, cell_type_order: list, device: str) -> dict:
+    """
+    Re-initialize :code:`ppi_x`, :code:`metagraph`, and transform packed batches of all graphs to a dictionary of batches. Note that different from :code:`train_batch2dict`, we are also re-initializing full :code:`ppi_x` because we are feeding all nodes instead of the sampled nodes in the batch to the model during prediction.
+    
+    :param packed_batch: An iterable (tuple if directly following unpacking of the output of :code:`generatePPIBatch`) storing batches of :class:`Data` from all graphs in one round.
+    :param metagraph_x_ori: metagraph original node embeddings.
+    :param ppi_x_ori: Original all PPI node embeddings
+    :param cell_type_order: Cell type order.
+    :param device: A string indicating the device. Default is "cuda".
+    
+    :return: A dictionary of edge data storing batches from all graphs in one round, :code:`ppi_x_batch`, :code:`ppi_node_ind_batch` extracted from batches, and the re-initialized node embeddings :code:`metagraph_x_init`.
+    """
+    # Re-initalize metagraph_x from metagraph_x in each batch
+    ppi_x_init = {key:x.clone().to(device) for key, x in ppi_x_ori.items()}
+    metagraph_x_init = metagraph_x_ori.clone().to(device) if len(metagraph_x_ori)!=0 else []
+    
+    # Unpack batches
+    ppi_data_batch = {key:{} for key in cell_type_order}
+    for ind, batch in enumerate(packed_batch):
+        i = cell_type_order[ind]
+        ori_map = batch.n_id
+        ppi_data_batch[i]['total_edge_index'] = ori_map[batch.edge_index].to(device)
+        ppi_data_batch[i]['total_edge_type'] = batch.edge_attr.to(device)
+        ppi_data_batch[i]['y'] = batch.y.to(device)
+    
+    return ppi_data_batch, ppi_x_init, metagraph_x_init
+
+
+def generate_batch(data_dict, edgetypes, edge_attr_dict, mask, batch_size, device, ppi=False, loader_type="graphsaint", num_layers=2):
     masked_data_dict = dict()
-    metapath_adjs_dict = dict()
+    edgetype_adjs_dict = dict()
     x_dict = dict()
     loader_dict = {}
 
@@ -246,9 +228,7 @@ def generate_batch(data_dict, metapaths, edge_attr_dict, mask, batch_size, devic
         total_edge_type = torch.cat([edge_type, neg_edge_type], dim=-1)
         y = torch.zeros(total_edge_index.size(1)).float() 
         y[:pos_edge_index.size(1)] = 1
-
-        # Metapath adjs
-        metapath_adjs_dict[key] = construct_metapath(metapaths, pos_edge_index, edge_type, data.x.size(0))
+        edgetype_adjs_dict[key] = construct_edgetype(edgetypes, pos_edge_index, edge_type, data.x.size(0))
 
         # Save information
         x_dict[key] = data.x.to(device)
@@ -260,7 +240,6 @@ def generate_batch(data_dict, metapaths, edge_attr_dict, mask, batch_size, devic
             if loader_type == "neighbor":
                 loader = NeighborLoader(data, num_neighbors = [-1] * num_layers, batch_size = batch_size, input_nodes = torch.arange(data.num_nodes), shuffle = True)
             elif loader_type == "graphsaint":
-                #loader = GraphSAINTRandomWalkSampler(data, batch_size = batch_size, walk_length = num_layers)
                 loader = GraphSAINTEdgeSampler(data, batch_size = batch_size, num_steps = 16)
             else:
                 raise NotImplementedError
@@ -272,7 +251,7 @@ def generate_batch(data_dict, metapaths, edge_attr_dict, mask, batch_size, devic
             masked_data_dict[key]["total_edge_type"] = total_edge_type.to(device)
             masked_data_dict[key]["y"] = y.to(device)
 
-    return loader_dict, masked_data_dict, metapath_adjs_dict, x_dict
+    return loader_dict, masked_data_dict, edgetype_adjs_dict, x_dict
 
 
 def negative_sampler(pos_edge_index, edge_type, edge_attr_dict):
